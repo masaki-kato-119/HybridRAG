@@ -5,7 +5,6 @@ ChromaDB を使用したハイブリッドインデックス実装。
 Dense は ChromaDB（永続化・コサイン類似度）、Sparse は TF-IDF で FAISS/Qdrant と同一の検索パイプラインを共有。
 """
 
-import os
 import pickle
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple

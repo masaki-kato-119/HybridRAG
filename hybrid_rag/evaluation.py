@@ -338,9 +338,7 @@ class RAGEvaluator:
 
         return dcg / idcg if idcg > 0 else 0.0
 
-    def evaluate_end_to_end(
-        self, test_cases: List[Dict], rag_system: Any
-    ) -> Dict[str, Any]:
+    def evaluate_end_to_end(self, test_cases: List[Dict], rag_system: Any) -> Dict[str, Any]:
         """
         エンドツーエンドの RAG 性能を評価する。
 
@@ -380,9 +378,7 @@ class RAGEvaluator:
 
         # Calculate summary statistics
         if response_times_list:
-            results["avg_response_time_ms"] = sum(response_times_list) / len(
-                response_times_list
-            )
+            results["avg_response_time_ms"] = sum(response_times_list) / len(response_times_list)
             results["max_response_time_ms"] = max(response_times_list)
             results["min_response_time_ms"] = min(response_times_list)
 

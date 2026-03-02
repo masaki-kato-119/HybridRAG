@@ -5,7 +5,8 @@
 """
 
 import re
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, DefaultDict, Dict, Hashable, List, Optional, Tuple
 
 from .indexing import HybridIndex
@@ -178,6 +179,7 @@ class RRFRetriever:
         retrieval_candidates_multiplier: int = 2,
         enable_cache: bool = False,
         cache_size: int = 1000,
+        enable_async: bool = True,
     ):
         """
         RRF 検索器を初期化する。
@@ -189,6 +191,7 @@ class RRFRetriever:
                 = top_k × この値。デフォルト 2。
             enable_cache: True のとき同一クエリ結果を LRU キャッシュする。デフォルト False。
             cache_size: キャッシュするエントリ数の上限。enable_cache 時のみ有効。デフォルト 1000。
+            enable_async: True のとき Dense/Sparse 検索を非同期並列実行する。デフォルト True。
         """
         self.hybrid_index = hybrid_index
         self.k = k
@@ -199,6 +202,9 @@ class RRFRetriever:
         self.enable_cache = enable_cache
         self.cache_size = cache_size
         self._cache: "OrderedDict[Hashable, Any]" = OrderedDict()
+        # 非同期実行設定
+        self.enable_async = enable_async
+        self._executor = ThreadPoolExecutor(max_workers=2) if enable_async else None
 
     def _make_cache_key(
         self,
@@ -252,6 +258,35 @@ class RRFRetriever:
             self._cache.popitem(last=False)
         self._cache[key] = value
 
+    def _search_parallel(
+        self, query: str, top_k: int
+    ) -> Tuple[List[Tuple[Dict, float]], List[Tuple[Dict, float]]]:
+        """
+        Dense と Sparse 検索を並列実行する。
+
+        Args:
+            query: 正規化済みクエリ文字列。
+            top_k: 取得する候補数。
+
+        Returns:
+            (dense_results, sparse_results) のタプル。
+        """
+        if self._executor is None:
+            # 非同期無効の場合は順次実行
+            dense_results = self.hybrid_index.dense_index.search(query, top_k)
+            sparse_results = self.hybrid_index.sparse_index.search(query, top_k)
+            return dense_results, sparse_results
+
+        # ThreadPoolExecutor で並列実行
+        dense_future = self._executor.submit(self.hybrid_index.dense_index.search, query, top_k)
+        sparse_future = self._executor.submit(self.hybrid_index.sparse_index.search, query, top_k)
+
+        # 両方の完了を待つ
+        dense_results = dense_future.result()
+        sparse_results = sparse_future.result()
+
+        return dense_results, sparse_results
+
     def retrieve(
         self,
         query: str,
@@ -260,6 +295,7 @@ class RRFRetriever:
         sparse_weight: float = 0.5,
         metadata_filters: Optional[Dict] = None,
         retrieval_candidates_multiplier: Optional[int] = None,
+        early_filtering: bool = True,
     ) -> List[Tuple[Dict, float]]:
         """
         Dense と Sparse の結果を RRF で統合して検索する。
@@ -271,6 +307,7 @@ class RRFRetriever:
             sparse_weight: Sparse の重み（RRF では未使用）。
             metadata_filters: メタデータフィルタ。省略可。
             retrieval_candidates_multiplier: 各検索の候補数の上書き（top_k × この値）。大きいほど RRF の候補が増える。
+            early_filtering: 段階的フィルタリングを有効にするかどうか。デフォルト True。
 
         Returns:
             (メタデータ, RRF スコア) タプルのリスト。
@@ -280,7 +317,12 @@ class RRFRetriever:
             if retrieval_candidates_multiplier is not None
             else self.retrieval_candidates_multiplier
         )
-        fetch_k = top_k * mult
+
+        # 段階的フィルタリング：フィルタがある場合は多めに取得
+        if early_filtering and metadata_filters:
+            fetch_k = top_k * mult * 3  # 3倍多く取得してフィルタ後に絞る
+        else:
+            fetch_k = top_k * mult
 
         # Normalize query（キャッシュキーにも使用）
         normalized_query = self.query_processor.normalize_query(query)
@@ -298,14 +340,25 @@ class RRFRetriever:
             return cached
 
         # Get results from both retrievers
-        dense_results = self.hybrid_index.dense_index.search(normalized_query, fetch_k)
-        sparse_results = self.hybrid_index.sparse_index.search(normalized_query, fetch_k)
+        if self.enable_async:
+            # 非同期並列実行
+            dense_results, sparse_results = self._search_parallel(normalized_query, fetch_k)
+        else:
+            # 従来の順次実行
+            dense_results = self.hybrid_index.dense_index.search(normalized_query, fetch_k)
+            sparse_results = self.hybrid_index.sparse_index.search(normalized_query, fetch_k)
 
         # Apply RRF
         rrf_results = self._apply_rrf(dense_results, sparse_results)
 
-        # Apply metadata filtering if specified
-        if metadata_filters:
+        # 段階的フィルタリング：メタデータフィルタを先に適用
+        if early_filtering and metadata_filters:
+            rrf_results = self.metadata_filter.filter_by_metadata(rrf_results, metadata_filters)
+            # フィルタ後の候補が十分あれば、top_k * mult に絞る
+            if len(rrf_results) > top_k * mult:
+                rrf_results = rrf_results[: top_k * mult]
+        elif metadata_filters:
+            # 従来の方法：フィルタを後で適用
             rrf_results = self.metadata_filter.filter_by_metadata(rrf_results, metadata_filters)
 
         # Return top-k results
@@ -357,8 +410,14 @@ class RRFRetriever:
         for query in queries:
             normalized = self.query_processor.normalize_query(query)
             normalized_queries.append(normalized)
-            dense_results = self.hybrid_index.dense_index.search(normalized, fetch_k)
-            sparse_results = self.hybrid_index.sparse_index.search(normalized, fetch_k)
+
+            if self.enable_async:
+                # 非同期並列実行
+                dense_results, sparse_results = self._search_parallel(normalized, fetch_k)
+            else:
+                # 従来の順次実行
+                dense_results = self.hybrid_index.dense_index.search(normalized, fetch_k)
+                sparse_results = self.hybrid_index.sparse_index.search(normalized, fetch_k)
 
             for rank, (metadata, _) in enumerate(dense_results, 1):
                 key = self._get_unique_key(metadata)
@@ -383,14 +442,10 @@ class RRFRetriever:
             return cached
 
         sorted_results = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-        final_results = [
-            (key_to_metadata[key], rrf_score) for key, rrf_score in sorted_results
-        ]
+        final_results = [(key_to_metadata[key], rrf_score) for key, rrf_score in sorted_results]
 
         if metadata_filters:
-            final_results = self.metadata_filter.filter_by_metadata(
-                final_results, metadata_filters
-            )
+            final_results = self.metadata_filter.filter_by_metadata(final_results, metadata_filters)
 
         final_results = final_results[:top_k]
         self._store_in_cache(cache_key, final_results)
@@ -423,9 +478,7 @@ class RRFRetriever:
             rrf_scores[key] += 1.0 / (self.k + rank)
 
         sorted_results = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-        final_results = [
-            (key_to_metadata[key], rrf_score) for key, rrf_score in sorted_results
-        ]
+        final_results = [(key_to_metadata[key], rrf_score) for key, rrf_score in sorted_results]
         return final_results
 
     def get_retrieval_stats(self, query: str, top_k: int = 10) -> Dict:

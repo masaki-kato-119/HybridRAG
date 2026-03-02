@@ -24,15 +24,43 @@ class DenseIndex:
     コサイン類似度で検索するため、ベクトルは L2 正規化して内積で比較する。
     """
 
-    def __init__(self, model_name: str = "paraphrase-multilingual-MiniLM-L12-v2"):
+    def __init__(
+        self,
+        model_name: str = "paraphrase-multilingual-MiniLM-L12-v2",
+        index_type: str = "flat",
+        nlist: int = 100,
+        hnsw_m: int = 32,
+        enable_embedding_cache: bool = True,
+        embedding_cache_size: int = 10000,
+    ):
         """
         Args:
             model_name: Sentence Transformers のモデル名（HuggingFace）。
+            index_type: FAISSインデックスのタイプ。
+                - "flat": IndexFlatIP（全件線形探索、最高精度）
+                - "ivf": IndexIVFFlat（クラスタリング、大規模データ向け）
+                - "hnsw": IndexHNSWFlat（階層グラフ、高速かつ高精度）
+            nlist: IVFインデックスのクラスタ数（index_type="ivf"時のみ有効）。
+            hnsw_m: HNSWインデックスのM値（index_type="hnsw"時のみ有効）。
+            enable_embedding_cache: 埋め込みキャッシュを有効にするかどうか。デフォルト True。
+            embedding_cache_size: 埋め込みキャッシュのサイズ。デフォルト 10000。
         """
         self.model = SentenceTransformer(model_name)
         self.index: Any = None
         self.chunk_metadata: List[Dict[str, Any]] = []
         self.dimension: Optional[int] = None
+        self.index_type = index_type
+        self.nlist = nlist
+        self.hnsw_m = hnsw_m
+
+        # 埋め込みキャッシュ
+        self.enable_embedding_cache = enable_embedding_cache
+        if enable_embedding_cache:
+            from .embedding_cache import EmbeddingCache
+
+            self.embedding_cache = EmbeddingCache(cache_size=embedding_cache_size)
+        else:
+            self.embedding_cache = None
 
     def build_index(self, chunks: List[Chunk]) -> None:
         """
@@ -54,15 +82,40 @@ class DenseIndex:
         embeddings = self.model.encode(texts, show_progress_bar=True)
         embeddings = embeddings.astype("float32")
 
-        # Initialize FAISS index
+        # Initialize FAISS index based on index_type
         self.dimension = embeddings.shape[1]
-        self.index = faiss.IndexFlatIP(self.dimension)  # Inner product for cosine similarity
 
         # Normalize embeddings for cosine similarity
         faiss.normalize_L2(embeddings)
 
-        # Add to index
-        self.index.add(embeddings)
+        if self.index_type == "flat":
+            # IndexFlatIP: 全件線形探索、最高精度
+            self.index = faiss.IndexFlatIP(self.dimension)
+            self.index.add(embeddings)
+
+        elif self.index_type == "ivf":
+            # IndexIVFFlat: クラスタリングベース、大規模データ向け
+            # 10万チャンク以上で効果的
+            quantizer = faiss.IndexFlatIP(self.dimension)
+            self.index = faiss.IndexIVFFlat(quantizer, self.dimension, self.nlist)
+            # IVFインデックスはトレーニングが必要
+            self.index.train(embeddings)
+            self.index.add(embeddings)
+            # 検索時のプローブ数（デフォルトは1、精度とのトレードオフ）
+            self.index.nprobe = min(10, self.nlist)
+
+        elif self.index_type == "hnsw":
+            # IndexHNSWFlat: 階層グラフベース、高速かつ高精度
+            # 中規模から大規模データに最適
+            self.index = faiss.IndexHNSWFlat(self.dimension, self.hnsw_m)
+            self.index.add(embeddings)
+            # efSearch（検索時の探索範囲、デフォルトは16）
+            self.index.hnsw.efSearch = 64
+
+        else:
+            raise ValueError(
+                f"Unknown index_type: {self.index_type}. Use 'flat', 'ivf', or 'hnsw'."
+            )
 
         # Store metadata (without content to save memory)
         # Content can be retrieved from database when needed
@@ -131,15 +184,38 @@ class DenseIndex:
         # Combine all embeddings
         embeddings = np.vstack(all_embeddings)
 
-        # Initialize FAISS index
+        # Initialize FAISS index based on index_type
         self.dimension = embeddings.shape[1]
-        self.index = faiss.IndexFlatIP(self.dimension)
 
         # Normalize embeddings for cosine similarity
         faiss.normalize_L2(embeddings)
 
-        # Add to index
-        self.index.add(embeddings)
+        if self.index_type == "flat":
+            # IndexFlatIP: 全件線形探索、最高精度
+            self.index = faiss.IndexFlatIP(self.dimension)
+            self.index.add(embeddings)
+
+        elif self.index_type == "ivf":
+            # IndexIVFFlat: クラスタリングベース、大規模データ向け
+            quantizer = faiss.IndexFlatIP(self.dimension)
+            self.index = faiss.IndexIVFFlat(quantizer, self.dimension, self.nlist)
+            # IVFインデックスはトレーニングが必要
+            self.index.train(embeddings)
+            self.index.add(embeddings)
+            # 検索時のプローブ数（デフォルトは1、精度とのトレードオフ）
+            self.index.nprobe = min(10, self.nlist)
+
+        elif self.index_type == "hnsw":
+            # IndexHNSWFlat: 階層グラフベース、高速かつ高精度
+            self.index = faiss.IndexHNSWFlat(self.dimension, self.hnsw_m)
+            self.index.add(embeddings)
+            # efSearch（検索時の探索範囲、デフォルトは16）
+            self.index.hnsw.efSearch = 64
+
+        else:
+            raise ValueError(
+                f"Unknown index_type: {self.index_type}. Use 'flat', 'ivf', or 'hnsw'."
+            )
 
         # Store metadata
         self.chunk_metadata = all_metadata
@@ -165,8 +241,15 @@ class DenseIndex:
             raise ValueError("Index not built. Call build_index first.")
         index = self.index
 
-        # Encode query
-        query_embedding = self.model.encode([query]).astype("float32")
+        # Encode query（埋め込みキャッシュを使用）
+        if self.embedding_cache is not None:
+            query_embedding = self.embedding_cache.get_or_compute(
+                query, lambda: self.model.encode([query]).astype("float32")[0]
+            )
+            query_embedding = query_embedding.reshape(1, -1).astype("float32")
+        else:
+            query_embedding = self.model.encode([query]).astype("float32")
+
         faiss.normalize_L2(query_embedding)
 
         # Search
@@ -201,6 +284,9 @@ class DenseIndex:
         model_info = {
             "model_name": self.model._modules["0"].auto_model.name_or_path,
             "dimension": self.dimension,
+            "index_type": self.index_type,
+            "nlist": self.nlist,
+            "hnsw_m": self.hnsw_m,
         }
         with open(path / "dense_model_info.json", "w") as f:
             json.dump(model_info, f, indent=2)
@@ -225,6 +311,9 @@ class DenseIndex:
         with open(path / "dense_model_info.json", "r") as f:
             model_info = json.load(f)
             self.dimension = model_info["dimension"]
+            self.index_type = model_info.get("index_type", "flat")
+            self.nlist = model_info.get("nlist", 100)
+            self.hnsw_m = model_info.get("hnsw_m", 32)
 
 
 class SparseIndex:
@@ -417,14 +506,40 @@ class HybridIndex:
         self,
         dense_model_name: str = "paraphrase-multilingual-MiniLM-L12-v2",
         sparse_max_features: int = 10000,
+        index_type: str = "flat",
+        nlist: int = 100,
+        hnsw_m: int = 32,
+        sparse_index_type: str = "bm25",
     ):
         """
         Args:
             dense_model_name: Dense インデックス用 Sentence Transformers モデル名。
             sparse_max_features: Sparse インデックス用の最大特徴量数。
+            index_type: FAISSインデックスのタイプ（"flat", "ivf", "hnsw"）。
+            nlist: IVFインデックスのクラスタ数。
+            hnsw_m: HNSWインデックスのM値。
+            sparse_index_type: Sparseインデックスのタイプ（"tfidf", "bm25"）。デフォルト "bm25"。
         """
-        self.dense_index = DenseIndex(dense_model_name)
-        self.sparse_index = SparseIndex(sparse_max_features)
+        self.dense_index = DenseIndex(
+            dense_model_name,
+            index_type=index_type,
+            nlist=nlist,
+            hnsw_m=hnsw_m,
+        )
+
+        # Sparseインデックスのタイプに応じて選択
+        if sparse_index_type == "bm25":
+            from .indexing_bm25 import BM25Index
+
+            self.sparse_index = BM25Index()
+        elif sparse_index_type == "tfidf":
+            self.sparse_index = SparseIndex(sparse_max_features)
+        else:
+            raise ValueError(
+                f"Unknown sparse_index_type: {sparse_index_type}. Use 'tfidf' or 'bm25'."
+            )
+
+        self.sparse_index_type = sparse_index_type
 
     def build_index(self, chunks: List[Chunk]) -> None:
         """

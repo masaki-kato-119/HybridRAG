@@ -8,8 +8,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from .caching import QueryCache
 from .chunking import Chunk, SemanticChunker
 from .context import ContextBuilder, PromptBuilder
+from .diversity import MMRSelector
 from .evaluation import RAGLogger, RetrievalLog
 from .indexing import HybridIndex
 from .ingestion import DocumentProcessor, SectionDetector
@@ -34,6 +36,24 @@ class HybridRAGSystem:
         rrf_k: int = 60,
         retrieval_candidates_multiplier: int = 2,
         query_expander: Optional[QueryExpander] = None,
+        enable_cache: bool = True,
+        cache_size: int = 1000,
+        cache_ttl_seconds: Optional[int] = 3600,
+        # FAISS最適化パラメータ
+        index_type: str = "flat",
+        nlist: int = 100,
+        hnsw_m: int = 32,
+        # Cross-encoder最適化パラメータ
+        rerank_batch_size: int = 32,
+        # 追加最適化パラメータ
+        sparse_index_type: str = "bm25",
+        enable_embedding_cache: bool = True,
+        embedding_cache_size: int = 10000,
+        enable_early_filtering: bool = True,
+        enable_async: bool = True,
+        # MMRパラメータ
+        enable_mmr: bool = False,
+        mmr_lambda: float = 0.6,
     ):
         """
         ハイブリッド RAG システムを初期化する。
@@ -51,21 +71,81 @@ class HybridRAGSystem:
                 = rerank_top_k × この値。デフォルト 2。
             query_expander: クエリ拡張用の QueryExpander インスタンス。
                 指定時は query() の冒頭で LLM によりキーワードを拡張し複数クエリで検索する。省略時は拡張なし。
+            enable_cache: クエリ結果キャッシングを有効にするかどうか。デフォルト True。
+            cache_size: キャッシュに保持する最大エントリ数。デフォルト 1000。
+            cache_ttl_seconds: キャッシュエントリの有効期限（秒）。Noneの場合は無期限。デフォルト 3600（1時間）。
+            index_type: FAISSインデックスのタイプ（"flat", "ivf", "hnsw"）。デフォルト "flat"。
+            nlist: IVFインデックスのクラスタ数。index_type="ivf"時のみ有効。デフォルト 100。
+            hnsw_m: HNSWインデックスのM値。index_type="hnsw"時のみ有効。デフォルト 32。
+            rerank_batch_size: Cross-encoder再ランキングのバッチサイズ。デフォルト 32。
+            sparse_index_type: Sparseインデックスのタイプ（"tfidf", "bm25"）。
+                デフォルト "bm25"。
+            enable_embedding_cache: 埋め込みキャッシュを有効にするかどうか。
+                デフォルト True。
+            embedding_cache_size: 埋め込みキャッシュのサイズ。デフォルト 10000。
+            enable_early_filtering: 段階的フィルタリングを有効にするかどうか。
+                デフォルト True。
+            enable_async: Dense/Sparse検索を非同期並列実行するかどうか。
+                デフォルト True。
+            enable_mmr: MMR（Maximal Marginal Relevance）による多様性選択を
+                有効にするかどうか。デフォルト False。
+            mmr_lambda: MMRのλパラメータ（0.0〜1.0）。1.0に近いほど関連度重視、
+                0.0に近いほど多様性重視。デフォルト 0.6。
         """
         # Initialize components
         self.db_manager = DatabaseManager(db_path)
         self.doc_processor = DocumentProcessor()
         self.section_detector = SectionDetector()
         self.chunker = SemanticChunker(max_chunk_size=max_chunk_size)
-        self.hybrid_index = HybridIndex(dense_model_name=dense_model)
+        self.hybrid_index = HybridIndex(
+            dense_model_name=dense_model,
+            index_type=index_type,
+            nlist=nlist,
+            hnsw_m=hnsw_m,
+            sparse_index_type=sparse_index_type,
+        )
+        # 埋め込みキャッシュの設定を適用
+        if hasattr(self.hybrid_index.dense_index, "enable_embedding_cache"):
+            self.hybrid_index.dense_index.enable_embedding_cache = enable_embedding_cache
+            if enable_embedding_cache:
+                from .embedding_cache import EmbeddingCache
+
+                self.hybrid_index.dense_index.embedding_cache = EmbeddingCache(
+                    cache_size=embedding_cache_size
+                )
+
         self.retriever: Optional[RRFRetriever] = None  # Set after build_index/load_index
-        self.reranker = HybridReranker(cross_encoder_model=rerank_model)
+        self.reranker = HybridReranker(
+            cross_encoder_model=rerank_model,
+            rerank_batch_size=rerank_batch_size,
+        )
         self.context_builder = ContextBuilder(max_tokens=max_context_tokens)
         self.prompt_builder = PromptBuilder()
         self.logger = RAGLogger(log_dir)
         self.rrf_k = rrf_k
         self.retrieval_candidates_multiplier = retrieval_candidates_multiplier
         self.query_expander = query_expander
+        self.enable_early_filtering = enable_early_filtering
+        self.enable_async = enable_async
+
+        # MMR設定
+        self.enable_mmr = enable_mmr
+        self.mmr_selector = (
+            MMRSelector(
+                embedding_model=self.hybrid_index.dense_index.model,
+                lambda_param=mmr_lambda,
+            )
+            if enable_mmr
+            else None
+        )
+
+        # Query cache
+        self.enable_cache = enable_cache
+        self.query_cache = (
+            QueryCache(cache_size=cache_size, ttl_seconds=cache_ttl_seconds)
+            if enable_cache
+            else None
+        )
 
         # Paths
         self.index_path = Path(index_path)
@@ -195,6 +275,7 @@ class HybridRAGSystem:
             retrieval_candidates_multiplier=self.retrieval_candidates_multiplier,
             enable_cache=True,
             cache_size=1000,
+            enable_async=self.enable_async,
         )
 
         self.is_indexed = True
@@ -218,6 +299,7 @@ class HybridRAGSystem:
             retrieval_candidates_multiplier=self.retrieval_candidates_multiplier,
             enable_cache=True,
             cache_size=1000,
+            enable_async=self.enable_async,
         )
         self.is_indexed = True
         print("Index loaded successfully!")
@@ -233,6 +315,7 @@ class HybridRAGSystem:
         retrieval_candidates_multiplier: Optional[int] = None,
         content_keywords: Optional[List[str]] = None,
         use_adaptive_candidates: bool = False,
+        use_cache: bool = True,
     ) -> Dict[str, Any]:
         """
         RAG システムにクエリを実行する。
@@ -243,10 +326,15 @@ class HybridRAGSystem:
             rerank_top_k: 再ランキング前に取得する候補数。大きいほど再ランキングの選択肢が増える。
             include_metadata: コンテキストにメタデータを含めるかどうか。
             include_scores: コンテキストに関連度スコアを含めるかどうか。
-            metadata_filters: メタデータフィルタ（doc_id, source_path, section, chunk_type など出典条件）。
-            retrieval_candidates_multiplier: 検索時の候補倍率の上書き。None で use_adaptive_candidates 時はクエリ長に応じて自動。
-            content_keywords: 指定時、チャンク本文がどれか1つでも含むものだけに絞ってから再ランキング。ヒット率向上用。
-            use_adaptive_candidates: True のとき、クエリ長に応じて候補倍率を 2/3/4 で動的調整（retrieval_candidates_multiplier 未指定時）。
+            metadata_filters: メタデータフィルタ（doc_id, source_path, section,
+                chunk_type など出典条件）。
+            retrieval_candidates_multiplier: 検索時の候補倍率の上書き。None で
+                use_adaptive_candidates 時はクエリ長に応じて自動。
+            content_keywords: 指定時、チャンク本文がどれか1つでも含むものだけに
+                絞ってから再ランキング。ヒット率向上用。
+            use_adaptive_candidates: True のとき、クエリ長に応じて候補倍率を
+                2/3/4 で動的調整（retrieval_candidates_multiplier 未指定時）。
+            use_cache: キャッシュを使用するかどうか。デフォルト True。
 
         Returns:
             クエリ結果の辞書（query, context, prompts, results, stats）。
@@ -256,6 +344,24 @@ class HybridRAGSystem:
                 self.load_index()
             except FileNotFoundError:
                 raise ValueError("No index found. Ingest documents and build index first.")
+
+        # キャッシュチェック
+        if use_cache and self.query_cache is not None:
+            cached_result = self.query_cache.get(
+                query=query,
+                top_k=top_k,
+                rerank_top_k=rerank_top_k,
+                metadata_filters=metadata_filters,
+                content_keywords=content_keywords,
+                retrieval_candidates_multiplier=retrieval_candidates_multiplier,
+            )
+            if cached_result is not None:
+                # キャッシュヒット: コピーを作成してfrom_cacheフラグを追加
+                import copy
+
+                result_copy = copy.deepcopy(cached_result)
+                result_copy["stats"]["from_cache"] = True
+                return result_copy
 
         start_time = time.time()
 
@@ -287,17 +393,12 @@ class HybridRAGSystem:
                 top_k=rerank_top_k,
                 metadata_filters=metadata_filters,
                 retrieval_candidates_multiplier=retrieval_candidates_multiplier,
+                early_filtering=self.enable_early_filtering,
             )
 
         # Ensure content is available in metadata (4.1.3: 一括取得で N+1 回避)
-        need_content = [
-            (m["doc_id"], m["chunk_index"])
-            for m, _ in results
-            if not m.get("content")
-        ]
-        content_map = (
-            self.db_manager.get_contents_batch(need_content) if need_content else {}
-        )
+        need_content = [(m["doc_id"], m["chunk_index"]) for m, _ in results if not m.get("content")]
+        content_map = self.db_manager.get_contents_batch(need_content) if need_content else {}
         results_with_content = []
         for metadata, score in results:
             key = (metadata["doc_id"], metadata["chunk_index"])
@@ -323,6 +424,16 @@ class HybridRAGSystem:
         rerank_start = time.time()
         reranked_results = self.reranker.rerank(query, results, top_k=top_k)
         rerank_time = (time.time() - rerank_start) * 1000
+
+        # MMR phase (optional): 多様性を考慮した選択
+        if self.enable_mmr and self.mmr_selector is not None and len(reranked_results) > top_k:
+            mmr_start = time.time()
+            reranked_results = self.mmr_selector.select(
+                results=reranked_results, top_k=top_k, embeddings=None
+            )
+            mmr_time = (time.time() - mmr_start) * 1000
+        else:
+            mmr_time = 0.0
 
         # Context building
         context = self.context_builder.build_context(
@@ -366,7 +477,7 @@ class HybridRAGSystem:
             metadata={"filters": metadata_filters},
         )
 
-        return {
+        result = {
             "query": query,
             "context": context,
             "prompts": prompts,
@@ -374,10 +485,26 @@ class HybridRAGSystem:
             "stats": {
                 "retrieval_time_ms": retrieval_time,
                 "rerank_time_ms": rerank_time,
+                "mmr_time_ms": mmr_time if self.enable_mmr else 0.0,
                 "total_time_ms": total_time,
                 "results_count": len(reranked_results),
+                "from_cache": False,
             },
         }
+
+        # キャッシュに保存
+        if use_cache and self.query_cache is not None:
+            self.query_cache.put(
+                query=query,
+                top_k=top_k,
+                rerank_top_k=rerank_top_k,
+                result=result,
+                metadata_filters=metadata_filters,
+                content_keywords=content_keywords,
+                retrieval_candidates_multiplier=retrieval_candidates_multiplier,
+            )
+
+        return result
 
     def get_system_stats(self) -> Dict[str, Any]:
         """
@@ -411,7 +538,30 @@ class HybridRAGSystem:
             },
         }
 
+        # キャッシュ統計を追加
+        if self.query_cache is not None:
+            stats["cache"] = self.query_cache.get_stats()
+
         return stats
+
+    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+        """
+        クエリキャッシュの統計情報を取得する。
+
+        Returns:
+            キャッシュ統計の辞書、またはキャッシュが無効の場合はNone。
+        """
+        if self.query_cache is None:
+            return None
+        return self.query_cache.get_stats()
+
+    def clear_cache(self) -> None:
+        """クエリキャッシュをクリアする。"""
+        if self.query_cache is not None:
+            self.query_cache.clear()
+            print("Query cache cleared.")
+        else:
+            print("Query cache is not enabled.")
 
     def delete_document(self, doc_id: str, rebuild_index: bool = True) -> None:
         """

@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import psycopg
 from pgvector.psycopg import register_vector
 from sentence_transformers import SentenceTransformer
@@ -72,8 +71,7 @@ class PostgresDenseIndex:
         try:
             with conn.cursor() as cur:
                 cur.execute("DROP TABLE IF EXISTS %s;" % self.table_name)
-                cur.execute(
-                    f"""
+                cur.execute(f"""
                     CREATE TABLE {self.table_name} (
                         id          bigserial PRIMARY KEY,
                         doc_id      text,
@@ -84,21 +82,19 @@ class PostgresDenseIndex:
                         content     text,
                         embedding   vector({self.dimension})
                     );
-                    """
-                )
-                cur.execute(
-                    f"""
+                    """)
+                cur.execute(f"""
                     CREATE INDEX {self.table_name}_embedding_idx
                     ON {self.table_name}
                     USING hnsw (embedding vector_cosine_ops);
-                    """
-                )
+                    """)
 
                 for chunk, emb in zip(chunks, embeddings):
                     cur.execute(
                         f"""
                         INSERT INTO {self.table_name}
-                            (doc_id, section, chunk_index, chunk_type, source_path, content, embedding)
+                            (doc_id, section, chunk_index, chunk_type,
+                             source_path, content, embedding)
                         VALUES (%s, %s, %s, %s, %s, %s, %s);
                         """,
                         (
@@ -325,4 +321,3 @@ class PostgresHybridIndex:
     def load(self, index_path: str) -> None:
         self.dense_index.load(index_path)
         self.sparse_index.load(index_path)
-

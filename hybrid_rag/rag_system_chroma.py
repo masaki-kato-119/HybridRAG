@@ -227,14 +227,8 @@ class ChromaHybridRAGSystem:
             )
 
         # content が欠けている場合のみ一括取得（4.1.3）
-        need_content = [
-            (m["doc_id"], m["chunk_index"])
-            for m, _ in results
-            if not m.get("content")
-        ]
-        content_map = (
-            self.db_manager.get_contents_batch(need_content) if need_content else {}
-        )
+        need_content = [(m["doc_id"], m["chunk_index"]) for m, _ in results if not m.get("content")]
+        content_map = self.db_manager.get_contents_batch(need_content) if need_content else {}
         results_with_content = []
         for metadata, score in results:
             key = (metadata["doc_id"], metadata["chunk_index"])

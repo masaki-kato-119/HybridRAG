@@ -6,7 +6,7 @@ Qdrantの高速フィルタリングを活用。
 
 使用方法:
     from hybrid_rag.rag_system_qdrant import QdrantHybridRAGSystem
-    
+
     # FAISS版と同じインターフェース
     rag = QdrantHybridRAGSystem()
     rag.ingest_documents(["document.pdf"])
@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from .caching import QueryCache
 from .chunking import Chunk, SemanticChunker
 from .context import ContextBuilder, PromptBuilder
 from .evaluation import RAGLogger, RetrievalLog
@@ -31,7 +32,7 @@ from .storage import DatabaseManager
 class QdrantHybridRAGSystem:
     """
     Qdrantを使用したハイブリッド RAG システム。
-    
+
     FAISS+SQLite版と比較した利点:
     - フィルタ検索が50-70%高速
     - メモリ使用量が30-50%削減可能
@@ -51,6 +52,10 @@ class QdrantHybridRAGSystem:
         rrf_k: int = 60,
         retrieval_candidates_multiplier: int = 2,
         query_expander: Optional[QueryExpander] = None,
+        enable_cache: bool = True,
+        cache_size: int = 1000,
+        cache_ttl_seconds: Optional[int] = 3600,
+        enable_async: bool = True,
     ):
         """
         Qdrant版ハイブリッド RAG システムを初期化する。
@@ -66,19 +71,23 @@ class QdrantHybridRAGSystem:
             rrf_k: RRF 定数。
             retrieval_candidates_multiplier: Dense/Sparse それぞれが返す候補数の倍率。
             query_expander: クエリ拡張用の QueryExpander インスタンス。
+            enable_cache: クエリ結果キャッシングを有効にするかどうか。デフォルト True。
+            cache_size: キャッシュに保持する最大エントリ数。デフォルト 1000。
+            cache_ttl_seconds: キャッシュエントリの有効期限（秒）。Noneの場合は無期限。デフォルト 3600（1時間）。
+            enable_async: Dense/Sparse検索を非同期並列実行するかどうか。デフォルト True。
         """
         # Initialize components
         self.db_manager = DatabaseManager(db_path)
         self.doc_processor = DocumentProcessor()
         self.section_detector = SectionDetector()
         self.chunker = SemanticChunker(max_chunk_size=max_chunk_size)
-        
+
         # Qdrant版のハイブリッドインデックス
         self.hybrid_index = QdrantHybridIndex(
             dense_model_name=dense_model,
             qdrant_path=qdrant_path,
         )
-        
+
         self.retriever: Optional[RRFRetriever] = None
         self.reranker = HybridReranker(cross_encoder_model=rerank_model)
         self.context_builder = ContextBuilder(max_tokens=max_context_tokens)
@@ -87,6 +96,15 @@ class QdrantHybridRAGSystem:
         self.rrf_k = rrf_k
         self.retrieval_candidates_multiplier = retrieval_candidates_multiplier
         self.query_expander = query_expander
+        self.enable_async = enable_async
+
+        # Query cache
+        self.enable_cache = enable_cache
+        self.query_cache = (
+            QueryCache(cache_size=cache_size, ttl_seconds=cache_ttl_seconds)
+            if enable_cache
+            else None
+        )
 
         # Paths
         self.qdrant_path = Path(qdrant_path)
@@ -102,15 +120,16 @@ class QdrantHybridRAGSystem:
     def close(self):
         """
         Qdrantクライアントを明示的にクローズする。
-        
+
         プログラム終了時のクリーンアップエラーを防ぐため、
         使用後に明示的に呼び出すことを推奨。
         """
         try:
-            if hasattr(self, 'hybrid_index') and hasattr(self.hybrid_index, 'dense_index'):
-                if hasattr(self.hybrid_index.dense_index, 'client'):
+            if hasattr(self, "hybrid_index") and hasattr(self.hybrid_index, "dense_index"):
+                if hasattr(self.hybrid_index.dense_index, "client"):
                     # Pythonシャットダウン時のImportErrorを回避
                     import sys
+
                     if sys.meta_path is not None:
                         self.hybrid_index.dense_index.client.close()
         except Exception:
@@ -175,7 +194,10 @@ class QdrantHybridRAGSystem:
             print(f"Ingestion complete: {stats}")
         except UnicodeEncodeError:
             # Windows console encoding issue workaround
-            print(f"Ingestion complete: processed={processed_docs}, failed={failed_docs}, chunks={len(all_chunks)}")
+            print(
+                f"Ingestion complete: processed={processed_docs}, "
+                f"failed={failed_docs}, chunks={len(all_chunks)}"
+            )
         return stats
 
     def build_index(self, batch_size: int = 1000) -> None:
@@ -232,13 +254,14 @@ class QdrantHybridRAGSystem:
         # Save the index (especially sparse index)
         self.hybrid_index.save(self.qdrant_path)
 
-        # Initialize retriever（キャッシュ有効化）
+        # Initialize retriever（キャッシュ・非同期有効化）
         self.retriever = RRFRetriever(
             self.hybrid_index,
             k=self.rrf_k,
             retrieval_candidates_multiplier=self.retrieval_candidates_multiplier,
             enable_cache=True,
             cache_size=1000,
+            enable_async=self.enable_async,
         )
 
         self.is_indexed = True
@@ -247,11 +270,11 @@ class QdrantHybridRAGSystem:
     def load_index(self) -> None:
         """
         既存のQdrantインデックスを読み込む。
-        
+
         Qdrantはファイルベースなので、自動的に読み込まれる。
         """
         print("Loading existing Qdrant index...")
-        
+
         try:
             self.hybrid_index.load(str(self.qdrant_path))
             self.retriever = RRFRetriever(
@@ -260,13 +283,12 @@ class QdrantHybridRAGSystem:
                 retrieval_candidates_multiplier=self.retrieval_candidates_multiplier,
                 enable_cache=True,
                 cache_size=1000,
+                enable_async=self.enable_async,
             )
             self.is_indexed = True
             print("Qdrant index loaded successfully!")
         except FileNotFoundError as e:
-            raise FileNotFoundError(
-                f"Qdrant index not found: {e}. Build index first."
-            )
+            raise FileNotFoundError(f"Qdrant index not found: {e}. Build index first.")
 
     def query(
         self,
@@ -279,10 +301,11 @@ class QdrantHybridRAGSystem:
         retrieval_candidates_multiplier: Optional[int] = None,
         content_keywords: Optional[List[str]] = None,
         use_adaptive_candidates: bool = False,
+        use_cache: bool = True,
     ) -> Dict[str, Any]:
         """
         RAG システムにクエリを実行する。
-        
+
         Qdrantの単一ステージフィルタリングにより、
         metadata_filters使用時にFAISS版より50-70%高速。
 
@@ -293,9 +316,11 @@ class QdrantHybridRAGSystem:
             include_metadata: コンテキストにメタデータを含めるかどうか。
             include_scores: コンテキストに関連度スコアを含めるかどうか。
             metadata_filters: メタデータフィルタ（Qdrantで高速処理）。
-            retrieval_candidates_multiplier: 検索時の候補倍率の上書き。None で use_adaptive_candidates 時はクエリ長に応じて自動。
+            retrieval_candidates_multiplier: 検索時の候補倍率の上書き。None で
+                use_adaptive_candidates 時はクエリ長に応じて自動。
             content_keywords: チャンク本文のキーワードフィルタ。
             use_adaptive_candidates: True のとき、クエリ長に応じて候補倍率を動的調整。
+            use_cache: キャッシュを使用するかどうか。デフォルト True。
 
         Returns:
             クエリ結果の辞書。
@@ -305,6 +330,24 @@ class QdrantHybridRAGSystem:
                 self.load_index()
             except FileNotFoundError:
                 raise ValueError("No index found. Ingest documents and build index first.")
+
+        # キャッシュチェック
+        if use_cache and self.query_cache is not None:
+            cached_result = self.query_cache.get(
+                query=query,
+                top_k=top_k,
+                rerank_top_k=rerank_top_k,
+                metadata_filters=metadata_filters,
+                content_keywords=content_keywords,
+                retrieval_candidates_multiplier=retrieval_candidates_multiplier,
+            )
+            if cached_result is not None:
+                # キャッシュヒット: コピーを作成してfrom_cacheフラグを追加
+                import copy
+
+                result_copy = copy.deepcopy(cached_result)
+                result_copy["stats"]["from_cache"] = True
+                return result_copy
 
         start_time = time.time()
 
@@ -338,14 +381,8 @@ class QdrantHybridRAGSystem:
             )
 
         # content が欠けている場合のみ一括取得（4.1.3）
-        need_content = [
-            (m["doc_id"], m["chunk_index"])
-            for m, _ in results
-            if not m.get("content")
-        ]
-        content_map = (
-            self.db_manager.get_contents_batch(need_content) if need_content else {}
-        )
+        need_content = [(m["doc_id"], m["chunk_index"]) for m, _ in results if not m.get("content")]
+        content_map = self.db_manager.get_contents_batch(need_content) if need_content else {}
         results_with_content = []
         for metadata, score in results:
             key = (metadata["doc_id"], metadata["chunk_index"])
@@ -413,7 +450,7 @@ class QdrantHybridRAGSystem:
             metadata={"filters": metadata_filters, "backend": "qdrant"},
         )
 
-        return {
+        result = {
             "query": query,
             "context": context,
             "prompts": prompts,
@@ -424,8 +461,23 @@ class QdrantHybridRAGSystem:
                 "total_time_ms": total_time,
                 "results_count": len(reranked_results),
                 "backend": "qdrant",
+                "from_cache": False,
             },
         }
+
+        # キャッシュに保存
+        if use_cache and self.query_cache is not None:
+            self.query_cache.put(
+                query=query,
+                top_k=top_k,
+                rerank_top_k=rerank_top_k,
+                result=result,
+                metadata_filters=metadata_filters,
+                content_keywords=content_keywords,
+                retrieval_candidates_multiplier=retrieval_candidates_multiplier,
+            )
+
+        return result
 
     def get_system_stats(self) -> Dict[str, Any]:
         """システム全体の統計を取得する。"""
@@ -446,7 +498,30 @@ class QdrantHybridRAGSystem:
             },
         }
 
+        # キャッシュ統計を追加
+        if self.query_cache is not None:
+            stats["cache"] = self.query_cache.get_stats()
+
         return stats
+
+    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+        """
+        クエリキャッシュの統計情報を取得する。
+
+        Returns:
+            キャッシュ統計の辞書、またはキャッシュが無効の場合はNone。
+        """
+        if self.query_cache is None:
+            return None
+        return self.query_cache.get_stats()
+
+    def clear_cache(self) -> None:
+        """クエリキャッシュをクリアする。"""
+        if self.query_cache is not None:
+            self.query_cache.clear()
+            print("Query cache cleared.")
+        else:
+            print("Query cache is not enabled.")
 
     def delete_document(self, doc_id: str, rebuild_index: bool = True) -> None:
         """

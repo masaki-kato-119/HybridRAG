@@ -36,8 +36,7 @@ class DatabaseManager:
             cursor = conn.cursor()
 
             # Documents table
-            cursor.execute(
-                """
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS documents (
                     doc_id TEXT PRIMARY KEY,
                     source_path TEXT NOT NULL,
@@ -47,12 +46,10 @@ class DatabaseManager:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     metadata TEXT
                 )
-            """
-            )
+            """)
 
             # Chunks table
-            cursor.execute(
-                """
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS chunks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     doc_id TEXT NOT NULL,
@@ -66,12 +63,10 @@ class DatabaseManager:
                     FOREIGN KEY (doc_id) REFERENCES documents (doc_id),
                     UNIQUE(doc_id, chunk_index)
                 )
-            """
-            )
+            """)
 
             # Retrieval logs table
-            cursor.execute(
-                """
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS retrieval_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -83,8 +78,7 @@ class DatabaseManager:
                     total_time_ms REAL,
                     metadata TEXT
                 )
-            """
-            )
+            """)
 
             # Create indexes
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id)")
@@ -264,16 +258,14 @@ class DatabaseManager:
         """
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT c.id, c.doc_id, c.chunk_index, c.section, c.chunk_type,
                        c.content, c.content_hash, c.created_at, c.metadata,
                        d.source_path
                 FROM chunks c
                 JOIN documents d ON c.doc_id = d.doc_id
                 ORDER BY c.doc_id, c.chunk_index
-                """
-            )
+                """)
             rows = cursor.fetchall()
 
             chunks = []
@@ -413,8 +405,7 @@ class DatabaseManager:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
 
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT
                     COUNT(*) as total_queries,
                     AVG(retrieval_time_ms) as avg_retrieval_time,
@@ -425,10 +416,7 @@ class DatabaseManager:
                     MIN(total_time_ms) as min_total_time
                 FROM retrieval_logs
                 WHERE timestamp > datetime('now', '-{} hours')
-            """.format(
-                    hours
-                )
-            )
+            """.format(hours))
 
             row = cursor.fetchone()
 
@@ -478,23 +466,19 @@ class DatabaseManager:
             chunk_count = cursor.fetchone()[0]
 
             # Chunk type distribution
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT chunk_type, COUNT(*)
                 FROM chunks
                 GROUP BY chunk_type
-            """
-            )
+            """)
             chunk_types = dict(cursor.fetchall())
 
             # Recent activity
-            cursor.execute(
-                """
+            cursor.execute("""
                 SELECT COUNT(*)
                 FROM retrieval_logs
                 WHERE timestamp > datetime('now', '-24 hours')
-            """
-            )
+            """)
             recent_queries = cursor.fetchone()[0]
 
             return {

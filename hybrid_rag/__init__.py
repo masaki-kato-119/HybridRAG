@@ -26,7 +26,7 @@ Dense（ベクトル）と Sparse（キーワード）を組み合わせた
     >>> rag = create_rag_system(backend="faiss")   # または "qdrant", "chroma", "postgres"
     >>> rag.ingest_documents(["doc.pdf"])
     >>> result = rag.query("質問文")
-    
+
     >>> # 直接インポート（FAISS版）
     >>> from hybrid_rag import HybridRAGSystem
     >>> rag = HybridRAGSystem()

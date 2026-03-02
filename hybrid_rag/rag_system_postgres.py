@@ -161,9 +161,7 @@ class PostgresHybridRAGSystem:
             self.is_indexed = True
             print("Postgres index loaded successfully!")
         except FileNotFoundError as e:
-            raise FileNotFoundError(
-                f"Postgres index not found: {e}. Build index first."
-            )
+            raise FileNotFoundError(f"Postgres index not found: {e}. Build index first.")
 
     def query(
         self,
@@ -215,14 +213,8 @@ class PostgresHybridRAGSystem:
             )
 
         # content が無い場合は一括取得（4.1.3）
-        need_content = [
-            (m["doc_id"], m["chunk_index"])
-            for m, _ in results
-            if not m.get("content")
-        ]
-        content_map = (
-            self.db_manager.get_contents_batch(need_content) if need_content else {}
-        )
+        need_content = [(m["doc_id"], m["chunk_index"]) for m, _ in results if not m.get("content")]
+        content_map = self.db_manager.get_contents_batch(need_content) if need_content else {}
         results_with_content = []
         for metadata, score in results:
             key = (metadata["doc_id"], metadata["chunk_index"])
@@ -297,4 +289,3 @@ class PostgresHybridRAGSystem:
                 "results_count": len(reranked_results),
             },
         }
-

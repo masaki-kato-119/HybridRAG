@@ -212,9 +212,7 @@ class HybridReranker:
 
         # Apply cross-encoder re-ranking (with batching)
         if self.use_cross_encoder and hasattr(self, "cross_encoder"):
-            current_results = self.cross_encoder.rerank(
-                query, current_results, top_k=top_k
-            )
+            current_results = self.cross_encoder.rerank(query, current_results, top_k=top_k)
 
         # Apply LLM re-ranking
         if self.use_llm and hasattr(self, "llm_reranker"):

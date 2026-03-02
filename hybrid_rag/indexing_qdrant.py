@@ -9,7 +9,6 @@ FAISS+SQLiteと比較した利点:
 - Dockerやサーバー不要（ローカルファイルベース）
 """
 
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from qdrant_client import QdrantClient
@@ -31,7 +30,7 @@ from .chunking import Chunk
 class QdrantDenseIndex:
     """
     Qdrantを使用した密ベクトルインデックス。
-    
+
     FAISS版と比較した利点:
     - メタデータフィルタが高速（単一ステージフィルタリング）
     - メモリ効率が良い（量子化サポート）
@@ -53,7 +52,7 @@ class QdrantDenseIndex:
         self.model = SentenceTransformer(model_name)
         self.collection_name = collection_name
         self.qdrant_path = qdrant_path
-        
+
         # ローカルファイルベースでQdrantクライアントを初期化（サーバー不要）
         self.client = QdrantClient(path=qdrant_path)
         self.dimension: Optional[int] = None
@@ -202,7 +201,7 @@ class QdrantDenseIndex:
     ) -> List[Tuple[Dict, float]]:
         """
         クエリに類似するチャンクを検索する。
-        
+
         Qdrantの単一ステージフィルタリングにより、
         FAISS版より50-70%高速なフィルタ検索が可能。
 
@@ -229,13 +228,9 @@ class QdrantDenseIndex:
                     # リストの場合はOR条件（いずれかに一致）
                     # Qdrantでは should を使う
                     for v in value:
-                        must_conditions.append(
-                            FieldCondition(key=key, match=MatchValue(value=v))
-                        )
+                        must_conditions.append(FieldCondition(key=key, match=MatchValue(value=v)))
                 else:
-                    must_conditions.append(
-                        FieldCondition(key=key, match=MatchValue(value=value))
-                    )
+                    must_conditions.append(FieldCondition(key=key, match=MatchValue(value=value)))
 
             if must_conditions:
                 query_filter = Filter(must=must_conditions)
@@ -282,8 +277,7 @@ class QdrantDenseIndex:
 
         if self.collection_name not in collection_names:
             raise FileNotFoundError(
-                f"Collection '{self.collection_name}' not found in Qdrant. "
-                f"Build index first."
+                f"Collection '{self.collection_name}' not found in Qdrant. " f"Build index first."
             )
 
         print(f"Qdrant collection '{self.collection_name}' loaded from {self.qdrant_path}")
@@ -292,7 +286,7 @@ class QdrantDenseIndex:
 class QdrantSparseIndex:
     """
     TF-IDF（BM25風）によるスパースインデックス。
-    
+
     Qdrantはスパースベクトルもサポートしているが、
     ここでは互換性のため従来のTF-IDF + コサイン類似度を使用。
     """
@@ -455,7 +449,7 @@ class QdrantSparseIndex:
 class QdrantHybridIndex:
     """
     Qdrant Dense と Sparse の両インデックスを保持し、ハイブリッド検索に供する。
-    
+
     FAISS+SQLite版と互換性のあるインターフェースを提供。
     """
 
