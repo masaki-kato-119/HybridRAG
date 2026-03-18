@@ -137,40 +137,69 @@ class QdrantHybridRAGSystem:
             pass
 
     def ingest_documents(
-        self, file_paths: List[Union[str, Path]], rebuild_index: bool = True
+        self,
+        file_paths: List[Union[str, Path]],
+        rebuild_index: bool = True,
+        metadata: Optional[Union[Dict, List[Optional[Dict]]]] = None,
+        skip_unchanged: bool = True,
     ) -> Dict[str, Any]:
         """
         ドキュメントをシステムに投入する。
 
+        差分更新に対応しており、ファイル内容が変わっていないドキュメントはスキップする。
+        任意のメタデータをドキュメント・チャンクに付与できる。
+
         Args:
             file_paths: 投入するファイルパスのリスト。
             rebuild_index: 投入後にインデックスを再構築するかどうか。
+            metadata: 各ドキュメントに付与する追加メタデータ。
+                - Dict を渡すと全ドキュメントに同じメタデータを付与。
+                - List[Optional[Dict]] を渡すと file_paths と 1 対 1 で対応。
+            skip_unchanged: True のとき、内容が変わっていないドキュメントをスキップする。
+                デフォルト True。
 
         Returns:
             投入結果の辞書。
         """
+        import hashlib as _hashlib
+
         print("Starting document ingestion...")
 
         all_chunks = []
         processed_docs = 0
+        skipped_docs = 0
         failed_docs = 0
 
-        for file_path in file_paths:
+        for i, file_path in enumerate(file_paths):
             try:
+                file_path = Path(file_path)
                 print(f"Processing: {file_path}")
 
-                # Process document
+                if isinstance(metadata, list):
+                    doc_meta = metadata[i] if i < len(metadata) else None
+                elif isinstance(metadata, dict):
+                    doc_meta = metadata
+                else:
+                    doc_meta = None
+
                 document = self.doc_processor.process_file(file_path)
+                if doc_meta:
+                    document.metadata = {**(document.metadata or {}), **doc_meta}
 
-                # Store document metadata
+                if skip_unchanged:
+                    existing = self.db_manager.get_document(document.doc_id)
+                    current_hash = _hashlib.md5(document.content.encode("utf-8")).hexdigest()
+                    if existing and existing.get("content_hash") == current_hash:
+                        print(f"  Skipped (unchanged): {file_path}")
+                        skipped_docs += 1
+                        continue
+
                 self.db_manager.store_document(document)
-
-                # Chunk document
                 chunks = self.chunker.chunk_document(document)
-
-                # Store chunks
+                if doc_meta:
+                    for chunk in chunks:
+                        chunk.metadata = {**(chunk.metadata or {}), **doc_meta}
                 self.db_manager.store_chunks(chunks)
-
                 all_chunks.extend(chunks)
                 processed_docs += 1
 
@@ -178,25 +207,24 @@ class QdrantHybridRAGSystem:
                 print(f"Failed to process {file_path}: {e}")
                 failed_docs += 1
 
-        # Rebuild index if requested
-        if rebuild_index and all_chunks:
+        if rebuild_index and (all_chunks or processed_docs > 0):
             print("Building Qdrant hybrid index...")
             self.build_index()
 
         stats = {
             "processed_documents": processed_docs,
+            "skipped_documents": skipped_docs,
             "failed_documents": failed_docs,
             "total_chunks": len(all_chunks),
-            "index_rebuilt": rebuild_index and all_chunks,
+            "index_rebuilt": rebuild_index and bool(all_chunks or processed_docs > 0),
         }
 
         try:
             print(f"Ingestion complete: {stats}")
         except UnicodeEncodeError:
-            # Windows console encoding issue workaround
             print(
                 f"Ingestion complete: processed={processed_docs}, "
-                f"failed={failed_docs}, chunks={len(all_chunks)}"
+                f"skipped={skipped_docs}, failed={failed_docs}, chunks={len(all_chunks)}"
             )
         return stats
 

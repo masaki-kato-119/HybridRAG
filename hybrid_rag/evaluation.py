@@ -343,8 +343,8 @@ class RAGEvaluator:
         エンドツーエンドの RAG 性能を評価する。
 
         Args:
-            test_cases: テストケースのリスト。各要素は 'query', 'expected_answer', 'relevant_docs' 等を持つ辞書。
-            rag_system: RAG システムのインスタンス。
+            test_cases: テストケースのリスト。各要素は 'query' と 'relevant_docs'（任意）を持つ辞書。
+            rag_system: RAG システムのインスタンス（query メソッドを持つ）。
 
         Returns:
             評価結果の辞書（total_cases, response_times, avg_response_time_ms など）。
@@ -352,31 +352,27 @@ class RAGEvaluator:
         response_times_list: List[float] = []
         results: Dict[str, Any] = {
             "total_cases": len(test_cases),
-            "retrieval_accuracy": [],
-            "answer_quality": [],
             "response_times": response_times_list,
+            "results": [],
         }
 
         for case in test_cases:
-            # query = case["query"]
-            # expected_answer = case.get("expected_answer", "")
-            # relevant_docs = set(case.get("relevant_docs", []))
+            query = case["query"]
 
-            # Measure response time
             start_time = time.time()
-
-            # Get RAG response (this would call your main RAG system)
-            # response = rag_system.query(query)
-
+            response = rag_system.query(query)
             end_time = time.time()
-            response_time = (end_time - start_time) * 1000  # ms
 
+            response_time = (end_time - start_time) * 1000
             response_times_list.append(response_time)
 
-            # Note: Answer quality evaluation would require additional
-            # metrics like BLEU, ROUGE, or LLM-based evaluation
+            results["results"].append({
+                "query": query,
+                "response_time_ms": response_time,
+                "results_count": response["stats"]["results_count"],
+                "from_cache": response["stats"].get("from_cache", False),
+            })
 
-        # Calculate summary statistics
         if response_times_list:
             results["avg_response_time_ms"] = sum(response_times_list) / len(response_times_list)
             results["max_response_time_ms"] = max(response_times_list)

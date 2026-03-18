@@ -3,6 +3,7 @@ Storage Module
 Handles SQLite database operations and file management.
 """
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -99,7 +100,7 @@ class DatabaseManager:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
 
-            content_hash = str(hash(document.content))
+            content_hash = hashlib.md5(document.content.encode("utf-8")).hexdigest()
             metadata_json = json.dumps(document.metadata) if document.metadata else None
 
             cursor.execute(
@@ -130,7 +131,7 @@ class DatabaseManager:
             cursor = conn.cursor()
 
             for chunk in chunks:
-                content_hash = str(hash(chunk.content))
+                content_hash = hashlib.md5(chunk.content.encode("utf-8")).hexdigest()
                 metadata_json = json.dumps(chunk.metadata) if chunk.metadata else None
 
                 cursor.execute(

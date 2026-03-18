@@ -9,9 +9,9 @@ RAG（Retrieval-Augmented Generation）の実装です。
 概要
 ----
 
-- **ingestion**: PDF / Markdown / HTML / テキストの取り込み
+- **ingestion**: PDF / Markdown / HTML / テキストの取り込み（差分更新・カスタムメタデータ対応）
 - **chunking**: セマンティックチャンキング（見出し・コード・表を考慮）
-- **indexing**: Dense (FAISS / Qdrant / ChromaDB / pgvector) + Sparse (TF-IDF)
+- **indexing**: Dense (FAISS / Qdrant / ChromaDB / pgvector) + Sparse (BM25 / TF-IDF)
 - **retrieval**: RRF（Reciprocal Rank Fusion）によるハイブリッド検索
 - **reranking**: Cross-encoder による再ランキング
 - **context**: トークン上限を考慮したコンテキスト構築
@@ -27,7 +27,16 @@ RAG（Retrieval-Augmented Generation）の実装です。
 
    # バックエンドを指定して RAG を生成（faiss / qdrant / chroma / postgres）
    rag = create_rag_system(backend="faiss")
+
+   # 差分更新（デフォルト）: 変更のないファイルはスキップ
    rag.ingest_documents(["document.pdf"])
+
+   # カスタムメタデータを付与
+   rag.ingest_documents(
+       ["doc1.pdf", "doc2.pdf"],
+       metadata={"category": "manual", "lang": "ja"},
+   )
+
    result = rag.query("質問文", top_k=5)
 
 目次
@@ -54,6 +63,10 @@ RAG（Retrieval-Augmented Generation）の実装です。
    modules/storage
    modules/evaluation
    modules/query_expansion
+   modules/caching
+   modules/embedding_cache
+   modules/diversity
+   modules/indexing_bm25
    modules/backends
    modules/indexing_qdrant
    modules/indexing_chroma

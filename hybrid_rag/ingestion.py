@@ -85,15 +85,24 @@ class DocumentProcessor:
 
     def _generate_doc_id(self, file_path: Path) -> str:
         """
-        ファイルパスから一意のドキュメント ID を生成する。
+        ファイル内容から一意のドキュメント ID を生成する。
+
+        内容ハッシュを使うため、同じファイルを別パスから取り込んでも同一 ID になり、
+        内容が変わらない限り再取り込みしても重複しない。
 
         Args:
             file_path: 対象ファイルのパス。
 
         Returns:
-            一意のドキュメント ID 文字列。
+            一意のドキュメント ID 文字列（例: report_a3f2）。
         """
-        return f"{file_path.stem}_{hash(str(file_path)) % 10000:04d}"
+        import hashlib
+
+        try:
+            content_hash = hashlib.md5(file_path.read_bytes()).hexdigest()[:8]
+        except Exception:
+            content_hash = f"{hash(str(file_path)) % 0xFFFFFFFF:08x}"
+        return f"{file_path.stem}_{content_hash}"
 
     def _process_pdf(self, file_path: Path) -> str:
         """

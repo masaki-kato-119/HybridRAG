@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from .caching import QueryCache
 from .chunking import Chunk, SemanticChunker
 from .context import ContextBuilder, PromptBuilder
 from .evaluation import RAGLogger, RetrievalLog
@@ -41,6 +42,9 @@ class PostgresHybridRAGSystem:
         rrf_k: int = 60,
         retrieval_candidates_multiplier: int = 2,
         query_expander: Optional[QueryExpander] = None,
+        enable_cache: bool = True,
+        cache_size: int = 1000,
+        cache_ttl_seconds: Optional[int] = 3600,
     ):
         self.db_manager = DatabaseManager(db_path)
         self.doc_processor = DocumentProcessor()
@@ -60,24 +64,79 @@ class PostgresHybridRAGSystem:
         self.retrieval_candidates_multiplier = retrieval_candidates_multiplier
         self.query_expander = query_expander
 
+        self.enable_cache = enable_cache
+        self.query_cache = (
+            QueryCache(cache_size=cache_size, ttl_seconds=cache_ttl_seconds)
+            if enable_cache
+            else None
+        )
+
         self.index_path = Path(index_path)
         self.index_path.mkdir(parents=True, exist_ok=True)
         self.is_indexed = False
 
     def ingest_documents(
-        self, file_paths: List[Union[str, Path]], rebuild_index: bool = True
+        self,
+        file_paths: List[Union[str, Path]],
+        rebuild_index: bool = True,
+        metadata: Optional[Union[Dict, List[Optional[Dict]]]] = None,
+        skip_unchanged: bool = True,
     ) -> Dict[str, Any]:
+        """
+        ドキュメントをシステムに投入する。
+
+        差分更新に対応しており、ファイル内容が変わっていないドキュメントはスキップする。
+        任意のメタデータをドキュメント・チャンクに付与できる。
+
+        Args:
+            file_paths: 投入するファイルパスのリスト。
+            rebuild_index: 投入後にインデックスを再構築するかどうか。
+            metadata: 各ドキュメントに付与する追加メタデータ。
+                - Dict を渡すと全ドキュメントに同じメタデータを付与。
+                - List[Optional[Dict]] を渡すと file_paths と 1 対 1 で対応。
+            skip_unchanged: True のとき、内容が変わっていないドキュメントをスキップする。
+                デフォルト True。
+
+        Returns:
+            投入結果の辞書。
+        """
+        import hashlib as _hashlib
+
         print("Starting document ingestion...")
         all_chunks: List[Chunk] = []
         processed_docs = 0
+        skipped_docs = 0
         failed_docs = 0
 
-        for file_path in file_paths:
+        for i, file_path in enumerate(file_paths):
             try:
+                file_path = Path(file_path)
                 print(f"Processing: {file_path}")
+
+                if isinstance(metadata, list):
+                    doc_meta = metadata[i] if i < len(metadata) else None
+                elif isinstance(metadata, dict):
+                    doc_meta = metadata
+                else:
+                    doc_meta = None
+
                 document = self.doc_processor.process_file(file_path)
+                if doc_meta:
+                    document.metadata = {**(document.metadata or {}), **doc_meta}
+
+                if skip_unchanged:
+                    existing = self.db_manager.get_document(document.doc_id)
+                    current_hash = _hashlib.md5(document.content.encode("utf-8")).hexdigest()
+                    if existing and existing.get("content_hash") == current_hash:
+                        print(f"  Skipped (unchanged): {file_path}")
+                        skipped_docs += 1
+                        continue
+
                 self.db_manager.store_document(document)
                 chunks = self.chunker.chunk_document(document)
+                if doc_meta:
+                    for chunk in chunks:
+                        chunk.metadata = {**(chunk.metadata or {}), **doc_meta}
                 self.db_manager.store_chunks(chunks)
                 all_chunks.extend(chunks)
                 processed_docs += 1
@@ -85,15 +144,16 @@ class PostgresHybridRAGSystem:
                 print(f"Failed to process {file_path}: {e}")
                 failed_docs += 1
 
-        if rebuild_index and all_chunks:
+        if rebuild_index and (all_chunks or processed_docs > 0):
             print("Building Postgres hybrid index...")
             self.build_index()
 
         stats = {
             "processed_documents": processed_docs,
+            "skipped_documents": skipped_docs,
             "failed_documents": failed_docs,
             "total_chunks": len(all_chunks),
-            "index_rebuilt": rebuild_index and bool(all_chunks),
+            "index_rebuilt": rebuild_index and bool(all_chunks or processed_docs > 0),
         }
         print(f"Ingestion complete: {stats}")
         return stats
@@ -174,12 +234,29 @@ class PostgresHybridRAGSystem:
         retrieval_candidates_multiplier: Optional[int] = None,
         content_keywords: Optional[List[str]] = None,
         use_adaptive_candidates: bool = False,
+        use_cache: bool = True,
     ) -> Dict[str, Any]:
         if not self.is_indexed:
             try:
                 self.load_index()
             except FileNotFoundError:
                 raise ValueError("No index found. Ingest documents and build index first.")
+
+        # キャッシュチェック
+        if use_cache and self.query_cache is not None:
+            cached_result = self.query_cache.get(
+                query=query,
+                top_k=top_k,
+                rerank_top_k=rerank_top_k,
+                metadata_filters=metadata_filters,
+                content_keywords=content_keywords,
+                retrieval_candidates_multiplier=retrieval_candidates_multiplier,
+            )
+            if cached_result is not None:
+                import copy
+                result_copy = copy.deepcopy(cached_result)
+                result_copy["stats"]["from_cache"] = True
+                return result_copy
 
         if self.retriever is None:
             raise ValueError("Retriever not initialized.")
@@ -277,7 +354,7 @@ class PostgresHybridRAGSystem:
             metadata={"filters": metadata_filters},
         )
 
-        return {
+        result = {
             "query": query,
             "context": context,
             "prompts": prompts,
@@ -287,5 +364,32 @@ class PostgresHybridRAGSystem:
                 "rerank_time_ms": rerank_time,
                 "total_time_ms": total_time,
                 "results_count": len(reranked_results),
+                "from_cache": False,
             },
         }
+
+        if use_cache and self.query_cache is not None:
+            self.query_cache.put(
+                query=query,
+                top_k=top_k,
+                rerank_top_k=rerank_top_k,
+                result=result,
+                metadata_filters=metadata_filters,
+                content_keywords=content_keywords,
+                retrieval_candidates_multiplier=retrieval_candidates_multiplier,
+            )
+
+        return result
+
+    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+        """クエリキャッシュの統計情報を取得する。"""
+        if self.query_cache is None:
+            return None
+        return self.query_cache.get_stats()
+
+    def clear_cache(self) -> None:
+        """クエリキャッシュをクリアする。"""
+        if self.query_cache is not None:
+            self.query_cache.clear()
+        else:
+            print("Query cache is not enabled.")

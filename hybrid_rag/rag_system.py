@@ -155,36 +155,76 @@ class HybridRAGSystem:
         self.is_indexed = False
 
     def ingest_documents(
-        self, file_paths: List[Union[str, Path]], rebuild_index: bool = True
+        self,
+        file_paths: List[Union[str, Path]],
+        rebuild_index: bool = True,
+        metadata: Optional[Union[Dict, List[Optional[Dict]]]] = None,
+        skip_unchanged: bool = True,
     ) -> Dict[str, Any]:
         """
         ドキュメントをシステムに投入する。
 
+        差分更新に対応しており、ファイル内容が変わっていないドキュメントはスキップする。
+        任意のメタデータをドキュメント・チャンクに付与できる。
+
         Args:
             file_paths: 投入するファイルパスのリスト。
             rebuild_index: 投入後にインデックスを再構築するかどうか。
+            metadata: 各ドキュメントに付与する追加メタデータ。
+                - Dict を渡すと全ドキュメントに同じメタデータを付与。
+                - List[Optional[Dict]] を渡すと file_paths と 1 対 1 で対応。
+                  対応する要素が None の場合はそのドキュメントにはメタデータなし。
+            skip_unchanged: True のとき、DB に保存済みの content_hash と一致する
+                ドキュメントをスキップする（差分更新）。デフォルト True。
 
         Returns:
-            投入結果の辞書（processed_documents, failed_documents, total_chunks, index_rebuilt）。
+            投入結果の辞書（processed_documents, skipped_documents,
+            failed_documents, total_chunks, index_rebuilt）。
         """
+        import hashlib as _hashlib
+
         print("Starting document ingestion...")
 
         all_chunks = []
         processed_docs = 0
+        skipped_docs = 0
         failed_docs = 0
 
-        for file_path in file_paths:
+        for i, file_path in enumerate(file_paths):
             try:
+                file_path = Path(file_path)
                 print(f"Processing: {file_path}")
+
+                # ファイルごとのメタデータを解決
+                if isinstance(metadata, list):
+                    doc_meta = metadata[i] if i < len(metadata) else None
+                elif isinstance(metadata, dict):
+                    doc_meta = metadata
+                else:
+                    doc_meta = None
 
                 # Process document
                 document = self.doc_processor.process_file(file_path)
+                if doc_meta:
+                    document.metadata = {**(document.metadata or {}), **doc_meta}
+
+                # 差分チェック: 同じ content_hash が DB にあればスキップ
+                if skip_unchanged:
+                    existing = self.db_manager.get_document(document.doc_id)
+                    current_hash = _hashlib.md5(document.content.encode("utf-8")).hexdigest()
+                    if existing and existing.get("content_hash") == current_hash:
+                        print(f"  Skipped (unchanged): {file_path}")
+                        skipped_docs += 1
+                        continue
 
                 # Store document metadata
                 self.db_manager.store_document(document)
 
-                # Chunk document
+                # Chunk document（メタデータをチャンクにも伝播）
                 chunks = self.chunker.chunk_document(document)
+                if doc_meta:
+                    for chunk in chunks:
+                        chunk.metadata = {**(chunk.metadata or {}), **doc_meta}
 
                 # Store chunks
                 self.db_manager.store_chunks(chunks)
@@ -197,15 +237,16 @@ class HybridRAGSystem:
                 failed_docs += 1
 
         # Rebuild index if requested
-        if rebuild_index and all_chunks:
+        if rebuild_index and (all_chunks or processed_docs > 0):
             print("Building hybrid index...")
             self.build_index()
 
         stats = {
             "processed_documents": processed_docs,
+            "skipped_documents": skipped_docs,
             "failed_documents": failed_docs,
             "total_chunks": len(all_chunks),
-            "index_rebuilt": rebuild_index and all_chunks,
+            "index_rebuilt": rebuild_index and bool(all_chunks or processed_docs > 0),
         }
 
         print(f"Ingestion complete: {stats}")

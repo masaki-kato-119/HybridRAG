@@ -5,14 +5,19 @@ from hybrid_rag.query_expansion import QueryExpander
 
 # システムの初期化（クエリ拡張あり: LLM でキーワードを拡張して複数クエリで検索）
 expander = QueryExpander(api_key=os.environ.get("OPENAI_API_KEY"), model="gpt-4o-mini")
-rag = create_rag_system(backend="qdrant")  # または "faiss"
+rag = create_rag_system(
+    backend="qdrant",
+    query_expander=expander,
+    #enable_mmr=True,      # MMRを有効化
+    #mmr_lambda=0.6,       # λパラメータ（0.0〜1.0）    
+)  # または "faiss"
 
 # ドキュメントの投入（初回またはインデックスを作り直すときはコメントを外す）
 # 注: Qdrant版に移行した場合、スパースインデックスも再構築が必要
-rag.ingest_documents(["xxx.pdf"])
+rag.ingest_documents(["xxxx.pdf"])
 
 # システムへのクエリ（クエリ拡張によりキーワードが広がり、複数クエリで RRF 検索）
-result = rag.query("機能を全て上げて", top_k=40, rerank_top_k=80)
+result = rag.query("機能を全て上げて", top_k=80, rerank_top_k=120)
 
 # RAG結果から OpenAI API で機能一覧レポートを生成
 def generate_door_report_with_openai(
